@@ -65,11 +65,13 @@ import kotlinx.coroutines.CoroutineScope
 import net.freifunk.darmstadt.nodewhisperer.models.GluonNode
 import net.freifunk.darmstadt.nodewhisperer.models.ScanResultListModel
 import net.freifunk.darmstadt.nodewhisperer.models.WifiScanResult
+import net.freifunk.darmstadt.nodewhisperer.models.WifiScanRaw
 import net.freifunk.darmstadt.nodewhisperer.models.enums.NodeStatus
 import net.freifunk.darmstadt.nodewhisperer.services.CommunityService
 import net.freifunk.darmstadt.nodewhisperer.services.NodeStatusService
 import net.freifunk.darmstadt.nodewhisperer.services.WifiScanService
 import net.freifunk.darmstadt.nodewhisperer.services.WifiScanServiceResultReceiver
+import net.freifunk.darmstadt.nodewhisperer.managers.WifiScanManager
 import net.freifunk.darmstadt.nodewhisperer.ui.theme.NodeWhispererTheme
 import org.json.JSONException
 import java.io.FileNotFoundException
@@ -80,11 +82,23 @@ class MainActivity : ComponentActivity() {
     val scanResultListModel = ScanResultListModel()
     val wifiScanService = WifiScanService(this)
     val communityService = CommunityService(this)
+    
+    // Enhanced WiFi scanning components
+    private lateinit var wifiScanManager: WifiScanManager
+    private var rawWifiScanResults = mutableListOf<WifiScanRaw>()
 
     fun haveAllPermissions(): Boolean {
         return checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED &&
                 checkSelfPermission(android.Manifest.permission.CHANGE_WIFI_STATE) == android.content.pm.PackageManager.PERMISSION_GRANTED &&
                 checkSelfPermission(android.Manifest.permission.ACCESS_WIFI_STATE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    fun haveBackgroundLocationPermission(): Boolean {
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            true // Not required on older versions
+        }
     }
 
     fun permissionToast() {
@@ -93,8 +107,10 @@ class MainActivity : ComponentActivity() {
     fun generateRawDebugInfo() =
         "scanning_enabled=${wifiScanService.scanningEnabled.value},\n" +
                 "scanning_paused=${wifiScanService.scanningPaused.value},\n" +
+                "raw_wifi_scanning_enabled=${wifiScanManager.isScanning()},\n" +
                 "total_nodes=${scanResultListModel.scanResults.size},\n" +
-                "nodes=" + scanResultListModel.scanResults.joinToString(";\n") { node ->
+                "total_raw_wifi_networks=${rawWifiScanResults.size},\n" +
+                "gluon_nodes=" + scanResultListModel.scanResults.joinToString(";\n") { node ->
             "hostname=${node.hostname ?: ""},\n" +
                     "node_id=${node.nodeId},\n" +
                     "status=${NodeStatusService.getNodeStatus(node)},\n" +
@@ -108,11 +124,16 @@ class MainActivity : ComponentActivity() {
                     "neighbors=${node.batmanAdv?.neighbors ?: ""},\n" +
                     "originators=${node.batmanAdv?.originators ?: ""},\n" +
                     "community_short_name=${node.communityInformation?.shortName ?: ""}"
+        } + "\n\nraw_wifi_networks=" + rawWifiScanResults.joinToString(";\n\n") { network ->
+            network.toDebugString()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Initialize WiFi scan manager
+        wifiScanManager = WifiScanManager(this)
+        
         setContent {
             activityDesign(this, wifiScanService, scanResultListModel)
         }
@@ -135,6 +156,15 @@ class MainActivity : ComponentActivity() {
         if (checkSelfPermission(android.Manifest.permission.ACCESS_WIFI_STATE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             requestPermissionLauncher.launch(android.Manifest.permission.ACCESS_WIFI_STATE)
         }
+        
+        // Request background location permission for Android 10+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+            checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissionLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        }
+
+        // Set up enhanced WiFi scanning
+        setupEnhancedWifiScanning()
 
         wifiScanService.registerReceiver(object : WifiScanServiceResultReceiver {
             override fun onScanResultUpdate(wifiScanResults: List<WifiScanResult>) {
@@ -146,7 +176,7 @@ class MainActivity : ComponentActivity() {
         if (!haveAllPermissions()) {
             permissionToast()
         } else {
-            toggleScanState(wifiScanService, scanResultListModel)
+            toggleScanState(wifiScanService, scanResultListModel, this)
         }
     }
 
@@ -155,6 +185,8 @@ class MainActivity : ComponentActivity() {
         if (wifiScanService.scanningEnabled.value) {
             wifiScanService.pauseScanning()
         }
+        // Pause enhanced WiFi scanning
+        wifiScanManager.pauseScanning()
     }
 
     override fun onResume() {
@@ -162,6 +194,16 @@ class MainActivity : ComponentActivity() {
         if (haveAllPermissions() && wifiScanService.scanningEnabled.value && wifiScanService.scanningPaused.value) {
             wifiScanService.resumeScanning()
         }
+        // Resume enhanced WiFi scanning if service is ready
+        if (wifiScanManager.isServiceReady()) {
+            wifiScanManager.resumeScanning()
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        // Clean up enhanced WiFi scanning
+        wifiScanManager.unbindService()
     }
 
     private fun updateScanResultList(wifiScanResults: List<WifiScanResult>) {
@@ -231,15 +273,57 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    
+    private fun setupEnhancedWifiScanning() {
+        // Bind to the enhanced WiFi scanning service
+        wifiScanManager.bindService()
+        
+        // Set up scan result listener
+        wifiScanManager.setScanResultListener(object : WifiScanManager.ScanResultListener {
+            override fun onScanResults(results: List<WifiScanRaw>) {
+                Log.d("MainActivity", "Enhanced WiFi scan results: ${results.size} networks")
+                
+                // Update raw scan results for debug export
+                rawWifiScanResults.clear()
+                rawWifiScanResults.addAll(results)
+                
+                // Log interesting findings
+                val gluonLikeNetworks = results.filter { it.isLikelyGluonNode() }
+                if (gluonLikeNetworks.isNotEmpty()) {
+                    Log.d("MainActivity", "Found ${gluonLikeNetworks.size} Gluon-like networks in raw scan")
+                }
+            }
+            
+            override fun onScanError(error: String) {
+                Log.e("MainActivity", "Enhanced WiFi scan error: $error")
+            }
+        })
+    }
+    
+    private fun startEnhancedWifiScanning() {
+        if (wifiScanManager.isServiceReady() && haveAllPermissions()) {
+            wifiScanManager.startContinuousScanning(5000) // 5 second interval
+            Log.d("MainActivity", "Started enhanced WiFi scanning")
+        }
+    }
+    
+    private fun stopEnhancedWifiScanning() {
+        wifiScanManager.stopContinuousScanning()
+        Log.d("MainActivity", "Stopped enhanced WiFi scanning")
+    }
 }
 
-fun toggleScanState(wifiScanService: WifiScanService, scanResultsList: ScanResultListModel) {
+fun toggleScanState(wifiScanService: WifiScanService, scanResultsList: ScanResultListModel, activity: MainActivity? = null) {
     if (wifiScanService.scanningEnabled.value) {
         wifiScanService.stopScanning()
+        // Also stop enhanced WiFi scanning
+        activity?.stopEnhancedWifiScanning()
         return
     }
 
     wifiScanService.startScanning()
+    // Also start enhanced WiFi scanning if available
+    activity?.startEnhancedWifiScanning()
 }
 
 fun getSiteDomainString(node: GluonNode): String? {
@@ -344,7 +428,7 @@ fun activityDesign(
                     ExtendedFloatingActionButton(
                         onClick = {
                             if (activity.haveAllPermissions()) {
-                                toggleScanState(wifiScanService!!, scanResultsList)
+                                toggleScanState(wifiScanService!!, scanResultsList, activity)
                             } else if (wifiScanService != null && !wifiScanService.scanningEnabled.value) {
                                 activity.permissionToast()
                             }
